@@ -160,14 +160,20 @@ class Exporter(Component):
 
 
 class ByteStream(Component):
+    def read(self, incoming_bytes):
+        """
+        Connect this ByteStream into the slimmeter_exporter channel
+        """
+        self.fire(read(incoming_bytes), "slimmeter_exporter")
+
     def init(self):
         self._ensure_connected_timer = Timer(
             5, ensure_connected(), self.channel, persist=True
         )
         self._ensure_connected_timer.register(self)
 
-    def read(self, incoming_bytes):
-        self.fire(read(incoming_bytes), "slimmeter_exporter")
+    def ensure_connected(self):
+        raise NotImplementedError
 
     def _on_signal(self, event, signo, stack):
         if signo in [SIGINT, SIGTERM]:
