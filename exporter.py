@@ -15,6 +15,7 @@ from collections import defaultdict
 from circuits import Component, Debugger, Event, Timer, handler
 from circuits.io.serial import Serial
 from circuits.core.events import started
+from circuits.io.events import read, close, ready
 from circuits.net.events import connect, disconnect
 from circuits.net.sockets import TCPClient
 
@@ -41,25 +42,6 @@ class read_telegram(Event):
     pass
 
 
-# def gauge_factory(name: str) -> Gauge:
-#     name = name.lower()
-#     return Gauge(name, name, ("meter_id", "active_tariff"))
-
-
-# def counter_factory(name: str) -> Counter:
-#     name = name.lower()
-#     return Counter(name, name, ("meter_id", "active_tariff"))
-
-
-# class keydefaultdict(defaultdict):
-#     def __missing__(self, key):
-#         if self.default_factory is None:
-#             raise KeyError(key)
-#         else:
-#             ret = self[key] = self.default_factory(key)
-#             return ret
-
-
 class TCPClientKeepalive(TCPClient):
     def _create_socket(self):
         sock = super()._create_socket()
@@ -74,7 +56,7 @@ class Exporter(Component):
     channel = "slimmeter_exporter"
 
     def __init__(self, *args, **kwargs):
-        self._transport_ready = False
+        # self._transport_ready = False
         self._receive_buffer = b""
         self._gauges = {}
         self._gauges_lock = Lock()
@@ -87,7 +69,6 @@ class Exporter(Component):
         # The Registry will call the `collect` method
         REGISTRY.register(self)
 
-
     def read(self, incoming_bytes):
         self._receive_buffer += incoming_bytes
         if re.search(b"!\w{4}\r\n", self._receive_buffer):
@@ -97,8 +78,8 @@ class Exporter(Component):
     def collect(self):
         if not self._meter_id and self._active_tariff:
             return None
-        if not self._transport_ready:
-            return None
+        # if not self._transport_ready:
+        #     return None
         with self._gauges_lock:
             for gauge, value in self._gauges.items():
                 gauge = gauge.lower()
@@ -120,14 +101,11 @@ class Exporter(Component):
         parser = TelegramParser(V5)
         try:
             telegram = parser.parse(telegram_bytes.decode("utf-8"))
-            # print(telegram)
         except ParseError:
             return None
-        # print(repr(telegram[ELECTRICITY_USED_TARIFF_1].value))
-        # print(repr(telegram[ELECTRICITY_USED_TARIFF_2].value))
         english_telegram_dict = {}
         for (obis_reference, cosem_object) in telegram.items():
-            if obis_reference in EN:
+            if obis_reference in EN and hasattr(cosem_object, 'value'):
                 english_telegram_dict[EN[obis_reference]] = [
                     cosem_object.value,
                     cosem_object.unit,
@@ -180,66 +158,67 @@ class Exporter(Component):
             # )
             self._counters[counter] = float(english_telegram_dict[counter][0])
 
-class SerialTTYExporter(Exporter):
-    def init(self, port):
-        self.serial = Serial(port, baudrate=115200, channel=self.channel)
-        self.serial.register(self)
 
-    def opened(self, port, baudrate):
-        self._transport_ready = True
+class ByteStream(Component):
+    def init(self):
+        self._ensure_connected_timer = Timer(
+            5, ensure_connected(), self.channel, persist=True
+        )
+        self._ensure_connected_timer.register(self)
 
-    def closed(self):
-        self._transport_ready = False
-
-
-class SerialTCPExporter(Exporter):
-    def __init__(self, serial_host, serial_port):
-        self._serial_connection = None
-        self._serial_host = serial_host
-        self._serial_port = serial_port
-        self._ensure_connected_timer = None
-        super(SerialTCPExporter, self).__init__(serial_host, serial_port)
-
-    def started(self, manager):
-        self.ensure_connected()
-        REGISTRY.register(self)
-
-    def connected(self, host, port):
-        self._transport_ready = True
-
-    def disconnected(self, host, port):
-        self._transport_ready = False
-
-    def ensure_connected(self):
-        if not self._serial_connection:
-            self._serial_connection = TCPClientKeepalive(channel=self.channel)
-            self._serial_connection.register(self)
-        if not self._serial_connection.connected:
-            self.fire(connect(self._serial_host, self._serial_port))
-        if not self._ensure_connected_timer:
-            self._ensure_connected_timer = Timer(
-                5, ensure_connected(), self.channel, persist=True
-            )
-            self._ensure_connected_timer.register(self)
+    def read(self, incoming_bytes):
+        self.fire(read(incoming_bytes), "slimmeter_exporter")
 
     def _on_signal(self, event, signo, stack):
         if signo in [SIGINT, SIGTERM]:
-            self._serial_connection.disconnect()
+            self.fire(close())
+            raise SystemExit
 
 
-# print(repr(english_telegram_dict))
-# print(json.dumps(english_telegram_dict, sort_keys=True, indent=1, default=str))
+class SerialTTY(ByteStream):
+    channel = "serial_tty"
+
+    def init(self, port):
+        self._opened = False
+        self.serial = Serial(port, baudrate=115200, channel=self.channel)
+        self.serial.register(self)
+        super(SerialTTY, self).init()
+
+    def opened(self, port, baudrate):
+        print(f"SerialTTY Opened")
+        self._opened = True
+
+    def closed(self):
+        print(f"SerialTTY Closed")
+        self._opened = False
+
+    def error(self, e):
+        self.fire(close())
+        print(f"SerialTTY Error: {e!r}")
+
+    def ensure_connected(self):
+        if not self._opened:
+            self.fire(ready(self))
+
+class SerialTCP(ByteStream):
+    channel = "serial_tcp"
+
+    def init(self, host, port):
+        self.host = host
+        self.port = port
+        self.connection = TCPClientKeepalive(channel=self.channel)
+        self.connection.register(self)
+        super(SerialTCP, self).init()
+
+    def ensure_connected(self):
+        if not self.connection.connected:
+            self.fire(connect(self.host, self.port))
 
 
 if __name__ == "__main__":
-
-    # import ptvsd
-    # ptvsd.enable_attach(('127.0.0.1', 5678))
-    # print("WAIT FOR ATTACH")
-    # ptvsd.wait_for_attach()
-
     start_http_server(9003)
-    # app = SerialTCPExporter("192.168.178.62", 31337)
-    app = SerialTTYExporter("/dev/smart_meter_p1")
+    app = Exporter()
+    app += SerialTTY("/dev/smart_meter_p1")
+    # app += SerialTCP("chip.flat.jof.io", 31337)
     # app += Debugger()
     app.run()
